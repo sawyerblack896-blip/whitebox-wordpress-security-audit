@@ -1,0 +1,11 @@
+$schema: ../../sdk/typescript/schemas/project-config.schema.json
+auth: chatgpt
+scan:
+  mode: standard
+  cyber_access_program: standard
+  knowledge_base:
+    - program-policy.md
+  instructions_file: scan-instructions.md
+codex:
+  model: gpt-5.6-sol
+  model_reasoning_effort: high

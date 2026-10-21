@@ -1,0 +1,175 @@
+import { execFile as nodeExecFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import * as z from "zod/v4";
+import {
+  artifactDestination,
+  artifactSourcePath,
+  paginateArtifactRows,
+  type ArtifactContext,
+  type ArtifactPage,
+} from "./artifact-io.js";
+import { artifactSchemaDocuments } from "./artifact-contracts.js";
+import {
+  missingPythonHelperMessage,
+  resolvePythonCommand,
+} from "./python_command.js";
+import { decodeUtf8 } from "./helpers/utf8.js";
+import { decodePosixBytes } from "./helpers/posix-path.js";
+
+const execFile = promisify(nodeExecFile);
+const inventoryComponents = ["artifacts", "02_discovery", "in_scope_files.txt"];
+const label = "review_items";
+
+const definitions = artifactSchemaDocuments["tools/review-items"].$defs;
+export type ReviewItem = z.infer<typeof definitions.reviewItem>;
+export const {
+  prepareInput: prepareReviewItemsInputSchema,
+  reviewItemsInput: reviewItemsReaderInputSchema,
+  reviewItem: reviewItemSchema,
+} = definitions;
+
+/** Build the selected repository or diff inventory from host-bound scan context. */
+export async function prepareCodexSecurityReviewItems(
+  context: ArtifactContext,
+) {
+  if (context.layout !== "scan") {
+    throw new Error(
+      `${label}: only a parent scan can prepare its shared inventory.`,
+    );
+  }
+  if (!context.pluginRoot) {
+    throw new Error(`${label}: the scan has no bound plugin context.`);
+  }
+
+  const destination = await artifactDestination(
+    context,
+    inventoryComponents,
+    label,
+  );
+  const pythonCommand = context.pythonCommand ?? (await resolvePythonCommand());
+  const helper = join(
+    context.pluginRoot,
+    "scripts",
+    "generate_in_scope_files.py",
+  );
+  const arguments_ = [
+    "-B",
+    helper,
+    "--repo",
+    context.repoRoot,
+    `--scope=${context.scope ?? "."}`,
+    "--out",
+    destination,
+  ];
+
+  if (context.mode === "diff") {
+    const target = context.targetContract?.diffTarget;
+    if (!target || typeof target !== "object" || Array.isArray(target)) {
+      throw new Error(
+        `${label}: the diff scan has no authoritative change set.`,
+      );
+    }
+    const diffTarget = target as Record<string, unknown>;
+    const { kind, baseRevision, headRevision } = diffTarget;
+    if (
+      (kind !== "working_tree" && kind !== "commit" && kind !== "range") ||
+      typeof baseRevision !== "string" ||
+      !baseRevision ||
+      typeof headRevision !== "string" ||
+      !headRevision
+    ) {
+      throw new Error(
+        `${label}: the diff scan has an invalid authoritative change set.`,
+      );
+    }
+    arguments_.push(
+      "--diff-base",
+      baseRevision,
+      "--diff-head",
+      headRevision,
+      "--diff-mode",
+      kind === "working_tree" ? "local-patch" : "revisions",
+    );
+  }
+
+  try {
+    await execFile(pythonCommand, arguments_, {
+      cwd: context.pluginRoot,
+      encoding: "utf8",
+      shell: false,
+    });
+  } catch (error) {
+    const missingPython = missingPythonHelperMessage(error, pythonCommand);
+    if (missingPython) {
+      throw new Error(`${label}: ${missingPython}`, { cause: error });
+    }
+    const details = helperError(error);
+    throw new Error(
+      `${label}: the scan inventory helper failed${details ? `: ${details}` : "."}`,
+      { cause: error },
+    );
+  }
+
+  return { reviewItemsTotal: (await readReviewItems(context)).length };
+}
+
+/** Return bounded source paths from the fixed scan or worker inventory. */
+export async function listCodexSecurityReviewItems(
+  context: ArtifactContext,
+  page: ArtifactPage = {},
+) {
+  const result = paginateArtifactRows(
+    await readReviewItems(context),
+    page,
+    label,
+  );
+  return {
+    items: result.rows,
+    ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
+  };
+}
+
+async function readReviewItems(
+  context: ArtifactContext,
+): Promise<ReviewItem[]> {
+  const path = await artifactSourcePath(context, inventoryComponents, label);
+  const contents = await readFile(path).catch((error: unknown) => {
+    throw new Error(
+      `${label}: the requested artifact cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  });
+  const source =
+    process.platform === "win32"
+      ? decodeUtf8(contents)
+      : decodePosixBytes(contents);
+  const rows: ReviewItem[] = [];
+
+  for (const [index, line] of source.split(/\r?\n/u).entries()) {
+    if (!line) continue;
+
+    const parsed = reviewItemSchema.safeParse({ path: line });
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const correction = issue?.message ? `: ${issue.message}` : ".";
+      throw new Error(
+        `${label}: inventory row ${index + 1} has an unsafe repository path${correction}`,
+      );
+    }
+    rows.push(parsed.data);
+  }
+
+  return rows;
+}
+
+function helperError(error: unknown): string {
+  if (error && typeof error === "object" && "stderr" in error) {
+    const stderr = error.stderr;
+    if (typeof stderr === "string" && stderr.trim()) return stderr.trim();
+    if (Buffer.isBuffer(stderr) && stderr.length)
+      return stderr.toString("utf8").trim();
+  }
+  return error instanceof Error ? error.message : String(error);
+}
