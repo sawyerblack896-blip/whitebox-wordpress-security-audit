@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.sqlite*
+*.jsonl
+logs/
+flows/
+evidence/
+reports/
+plugins/
+targets/
+credentials/
